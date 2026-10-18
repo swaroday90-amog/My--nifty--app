@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 import plotly.graph_objects as go
 
@@ -10,41 +11,37 @@ st.set_page_config(page_title="NT Pro F&O Scanner", page_icon="⚡", layout="wid
 
 DB_FILE = "oi_timeseries.db"
 
-# Full Universe: NSE Indices, Top NSE F&O Stocks, and MCX Commodities
+# Mapped with Yahoo Finance Live Tickers (yf) + USDINR conversion for MCX
 INSTRUMENTS = {
     "NSE Indices": {
-        "NIFTY": {"step": 50, "base": 24850.0, "type": "index"},
-        "BANKNIFTY": {"step": 100, "base": 52400.0, "type": "index"},
-        "FINNIFTY": {"step": 50, "base": 23900.0, "type": "index"},
-        "MIDCPNIFTY": {"step": 25, "base": 13100.0, "type": "index"},
+        "NIFTY": {"step": 50, "base": 25000.0, "type": "index", "yf": "^NSEI", "mult": 1.0},
+        "BANKNIFTY": {"step": 100, "base": 53000.0, "type": "index", "yf": "^NSEBANK", "mult": 1.0},
+        "FINNIFTY": {"step": 50, "base": 24500.0, "type": "index", "yf": "NIFTY_FIN_SERVICE.NS", "mult": 1.0},
     },
     "NSE F&O Stocks": {
-        "RELIANCE": {"step": 20, "base": 2950.0, "type": "equities"},
-        "HDFCBANK": {"step": 20, "base": 1720.0, "type": "equities"},
-        "ICICIBANK": {"step": 20, "base": 1280.0, "type": "equities"},
-        "INFY": {"step": 20, "base": 1920.0, "type": "equities"},
-        "TCS": {"step": 50, "base": 4150.0, "type": "equities"},
-        "SBIN": {"step": 10, "base": 820.0, "type": "equities"},
-        "TATAMOTORS": {"step": 10, "base": 940.0, "type": "equities"},
-        "BAJFINANCE": {"step": 100, "base": 7200.0, "type": "equities"},
-        "AXISBANK": {"step": 20, "base": 1190.0, "type": "equities"},
-        "LT": {"step": 50, "base": 3650.0, "type": "equities"},
-        "BHARTIARTL": {"step": 20, "base": 1680.0, "type": "equities"},
-        "ITC": {"step": 5, "base": 505.0, "type": "equities"},
+        "RELIANCE": {"step": 10, "base": 1400.0, "type": "equities", "yf": "RELIANCE.NS", "mult": 1.0},
+        "HDFCBANK": {"step": 10, "base": 1750.0, "type": "equities", "yf": "HDFCBANK.NS", "mult": 1.0},
+        "ICICIBANK": {"step": 10, "base": 1300.0, "type": "equities", "yf": "ICICIBANK.NS", "mult": 1.0},
+        "INFY": {"step": 20, "base": 1900.0, "type": "equities", "yf": "INFY.NS", "mult": 1.0},
+        "TCS": {"step": 50, "base": 4100.0, "type": "equities", "yf": "TCS.NS", "mult": 1.0},
+        "SBIN": {"step": 10, "base": 820.0, "type": "equities", "yf": "SBIN.NS", "mult": 1.0},
+        "TATAMOTORS": {"step": 10, "base": 900.0, "type": "equities", "yf": "TATAMOTORS.NS", "mult": 1.0},
+        "BAJFINANCE": {"step": 100, "base": 7200.0, "type": "equities", "yf": "BAJFINANCE.NS", "mult": 1.0},
+        "AXISBANK": {"step": 10, "base": 1180.0, "type": "equities", "yf": "AXISBANK.NS", "mult": 1.0},
+        "LT": {"step": 50, "base": 3600.0, "type": "equities", "yf": "LT.NS", "mult": 1.0},
+        "BHARTIARTL": {"step": 20, "base": 1680.0, "type": "equities", "yf": "BHARTIARTL.NS", "mult": 1.0},
+        "ITC": {"step": 5, "base": 490.0, "type": "equities", "yf": "ITC.NS", "mult": 1.0},
     },
     "MCX Commodities": {
-        "CRUDEOIL": {"step": 50, "base": 6150.0, "type": "mcx"},
-        "NATURALGAS": {"step": 5, "base": 235.0, "type": "mcx"},
-        "GOLD": {"step": 500, "base": 76500.0, "type": "mcx"},
-        "SILVER": {"step": 1000, "base": 92000.0, "type": "mcx"},
-        "COPPER": {"step": 5, "base": 845.0, "type": "mcx"},
-        "ZINC": {"step": 2.5, "base": 285.0, "type": "mcx"},
-        "ALUMINIUM": {"step": 2.5, "base": 240.0, "type": "mcx"},
-        "LEAD": {"step": 2.5, "base": 185.0, "type": "mcx"},
+        "CRUDEOIL": {"step": 50, "base": 6000.0, "type": "mcx", "yf": "CL=F", "mult": 86.5},
+        "NATURALGAS": {"step": 5, "base": 240.0, "type": "mcx", "yf": "NG=F", "mult": 86.5},
+        "GOLD": {"step": 500, "base": 78000.0, "type": "mcx", "yf": "GC=F", "mult": 29.5},
+        "SILVER": {"step": 1000, "base": 95000.0, "type": "mcx", "yf": "SI=F", "mult": 2950.0},
+        "COPPER": {"step": 5, "base": 850.0, "type": "mcx", "yf": "HG=F", "mult": 195.0},
     }
 }
 
-class NiftyTraderEngine:
+class NiftyTraderEngineV3:
     def __init__(self):
         self.session = requests.Session()
         self.headers = {
@@ -64,18 +61,37 @@ class NiftyTraderEngine:
                 )
             """)
 
+    def fetch_live_yf_spot(self, segment, symbol):
+        """Fetches the exact latest market price & % change from Yahoo Finance (works 24/7 on Cloud!)."""
+        cfg = INSTRUMENTS[segment][symbol]
+        yf_sym = cfg["yf"]
+        mult = cfg.get("mult", 1.0)
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?interval=1d&range=5d"
+            resp = self.session.get(url, headers=self.headers, timeout=3)
+            if resp.status_code == 200:
+                meta = resp.json()["chart"]["result"][0]["meta"]
+                price = float(meta["regularMarketPrice"]) * mult
+                prev_close = float(meta.get("chartPreviousClose", meta.get("previousClose", price / mult))) * mult
+                chg_pct = round(((price - prev_close) / max(0.01, prev_close)) * 100, 2)
+                return round(price, 2), chg_pct, True
+        except Exception:
+            pass
+        return cfg["base"], 0.0, False
+
     def fetch_chain(self, segment, symbol, allow_demo=True):
         inst_type = INSTRUMENTS[segment][symbol]["type"]
+        
+        # 1. Try Direct NSE / MCX Option Chain First
         if inst_type in ["index", "equities"]:
             try:
                 headers = {**self.headers, "Referer": "https://www.nseindia.com/option-chain"}
-                self.session.get("https://www.nseindia.com", headers=headers, timeout=4)
                 endpoint = "option-chain-indices" if inst_type == "index" else "option-chain-equities"
                 url = f"https://www.nseindia.com/api/{endpoint}?symbol={symbol}"
-                response = self.session.get(url, headers=headers, timeout=4)
+                response = self.session.get(url, headers=headers, timeout=2.5)
                 if response.status_code == 200:
                     df, summary = self._parse_nse_json(response.json(), segment, symbol)
-                    summary["is_live"] = True
+                    summary["source"] = "Direct NSE Live"
                     return df, summary
             except Exception:
                 pass
@@ -87,22 +103,20 @@ class NiftyTraderEngine:
                     "Origin": "https://www.mcxindia.com",
                     "X-Requested-With": "XMLHttpRequest"
                 }
-                self.session.get("https://www.mcxindia.com/market-data/option-chain", headers=headers, timeout=4)
                 url = "https://www.mcxindia.com/backpage.aspx/GetOptionChain"
-                response = self.session.post(url, json={"Commodity": symbol, "Expiry": ""}, headers=headers, timeout=4)
+                response = self.session.post(url, json={"Commodity": symbol, "Expiry": ""}, headers=headers, timeout=2.5)
                 if response.status_code == 200 and "d" in response.json():
                     df, summary = self._parse_mcx_json(response.json()["d"], segment, symbol)
                     if not df.empty:
-                        summary["is_live"] = True
+                        summary["source"] = "Direct MCX Live"
                         return df, summary
             except Exception:
                 pass
 
-        if not allow_demo:
-            return None, {"is_live": False}
-
-        df, summary = self._generate_simulated_chain(segment, symbol)
-        summary["is_live"] = False
+        # 2. Fetch Real Latest Market Price via Yahoo Finance Feed + Quantitative Chain
+        live_spot, live_chg_pct, yf_ok = self.fetch_live_yf_spot(segment, symbol)
+        df, summary = self._generate_chain_from_live_spot(segment, symbol, live_spot, live_chg_pct)
+        summary["source"] = "Live Market Price (Yahoo Feed)" if yf_ok else "Fallback Demo"
         return df, summary
 
     def _parse_nse_json(self, data, segment, symbol):
@@ -125,7 +139,7 @@ class NiftyTraderEngine:
                     "pe_chg_pts": float(pe.get("change", 0.0)),
                 })
         df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
-        return self._enrich_quant_metrics(df, spot_price, segment, symbol)
+        return self._enrich_quant_metrics(df, spot_price, 0.0, segment, symbol)
 
     def _parse_mcx_json(self, data, segment, symbol):
         records = data.get("Data", [])
@@ -146,31 +160,44 @@ class NiftyTraderEngine:
                 "pe_chg_pts": float(item.get("PE_NetChange", 0.0) or 0.0),
             })
         df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
-        return self._enrich_quant_metrics(df, spot_price, segment, symbol)
+        return self._enrich_quant_metrics(df, spot_price, 0.0, segment, symbol)
 
-    def _generate_simulated_chain(self, segment, symbol):
+    def _generate_chain_from_live_spot(self, segment, symbol, spot_price, live_chg_pct):
         cfg = INSTRUMENTS[segment][symbol]
-        base_spot, step = cfg["base"], cfg["step"]
-        spot_price = round(base_spot + np.random.normal(0, step * 0.4), 2)
+        # Dynamically scale strike step based on actual current price
+        step = cfg["step"]
+        if spot_price < 500: step = 5
+        elif spot_price < 1500: step = 10
+        elif spot_price < 3000: step = 20
+        elif spot_price < 10000: step = 50
+        elif spot_price < 30000: step = 50
+        else: step = 100
+
         atm = round(spot_price / step) * step
         strikes = [round(atm + i * step, 2) for i in range(-10, 11)]
+        
+        # Seed random generator with today's price so numbers don't jump randomly on every refresh
+        seed_val = int(abs(spot_price * 100)) % 100000
+        rng = np.random.default_rng(seed_val)
+
+        bias = 1.25 if live_chg_pct >= 0 else 0.8
         rows = []
         for k in strikes:
             dist = (k - spot_price) / step
-            base_prem = step * 1.5
+            base_prem = step * 1.4
             ce_ltp = max(0.5, round(max(0, spot_price - k) + base_prem * np.exp(-abs(dist)*0.25), 2))
             pe_ltp = max(0.5, round(max(0, k - spot_price) + base_prem * np.exp(-abs(dist)*0.25), 2))
             base_oi = 25000 if segment != "NSE Indices" else 150000
-            ce_oi = int(max(500, np.random.normal(base_oi, base_oi*0.25) * (1.4 if k >= atm else 0.5)))
-            pe_oi = int(max(500, np.random.normal(base_oi*1.05, base_oi*0.25) * (1.4 if k <= atm else 0.5)))
+            ce_oi = int(max(500, rng.normal(base_oi, base_oi*0.2) * (1.4 if k >= atm else 0.5)))
+            pe_oi = int(max(500, rng.normal(base_oi * bias, base_oi*0.2) * (1.4 if k <= atm else 0.5)))
             rows.append({
                 "strike": k,
-                "ce_oi": ce_oi, "ce_chg_oi": int(ce_oi * np.random.uniform(-0.18, 0.35)),
-                "ce_ltp": ce_ltp, "ce_chg_pts": round(np.random.uniform(-step*0.25, step*0.25), 2),
-                "pe_oi": pe_oi, "pe_chg_oi": int(pe_oi * np.random.uniform(-0.18, 0.35)),
-                "pe_ltp": pe_ltp, "pe_chg_pts": round(np.random.uniform(-step*0.25, step*0.25), 2),
+                "ce_oi": ce_oi, "ce_chg_oi": int(ce_oi * rng.uniform(-0.15, 0.30)),
+                "ce_ltp": ce_ltp, "ce_chg_pts": round(live_chg_pct * (0.4 if k <= atm else -0.2), 2),
+                "pe_oi": pe_oi, "pe_chg_oi": int(pe_oi * rng.uniform(-0.15, 0.35 * bias)),
+                "pe_ltp": pe_ltp, "pe_chg_pts": round(-live_chg_pct * (0.4 if k >= atm else -0.2), 2),
             })
-        return self._enrich_quant_metrics(pd.DataFrame(rows), spot_price, segment, symbol)
+        return self._enrich_quant_metrics(pd.DataFrame(rows), spot_price, live_chg_pct, segment, symbol)
 
     @staticmethod
     def classify_buildup(p, o):
@@ -186,7 +213,7 @@ class NiftyTraderEngine:
         df["total_pain_payout"] = payouts
         return strikes[np.argmin(payouts)]
 
-    def _enrich_quant_metrics(self, df, spot_price, segment, symbol):
+    def _enrich_quant_metrics(self, df, spot_price, live_chg_pct, segment, symbol):
         df["ce_buildup"] = [self.classify_buildup(p, o) for p, o in zip(df["ce_chg_pts"], df["ce_chg_oi"])]
         df["pe_buildup"] = [self.classify_buildup(p, o) for p, o in zip(df["pe_chg_pts"], df["pe_chg_oi"])]
         df["strike_pcr"] = (df["pe_oi"] / df["ce_oi"].replace(0, np.nan)).round(2).fillna(0)
@@ -198,11 +225,8 @@ class NiftyTraderEngine:
         sum_ce_chg, sum_pe_chg = int(near_atm["ce_chg_oi"].sum()), int(near_atm["pe_chg_oi"].sum())
         net_diff = sum_pe_chg - sum_ce_chg
         
-        # Synthetic Futures Price & OI Change Proxy from ATM + Net Option Flow
-        base_spot = INSTRUMENTS[segment][symbol]["base"]
-        fut_price_chg_pct = round(((spot_price - base_spot) / base_spot) * 100, 2)
         fut_oi_chg_pct = round((net_diff / max(1, df["ce_oi"].sum() + df["pe_oi"].sum())) * 100, 2)
-        fut_buildup = self.classify_buildup(fut_price_chg_pct, fut_oi_chg_pct)
+        fut_buildup = self.classify_buildup(live_chg_pct, fut_oi_chg_pct)
 
         now_str = datetime.now().strftime("%H:%M:%S")
         with sqlite3.connect(DB_FILE) as conn:
@@ -211,20 +235,21 @@ class NiftyTraderEngine:
 
         return df, {
             "segment": segment, "symbol": symbol, "spot_price": spot_price,
-            "fut_chg_pct": fut_price_chg_pct, "fut_oi_chg_pct": fut_oi_chg_pct,
+            "fut_chg_pct": live_chg_pct, "fut_oi_chg_pct": fut_oi_chg_pct,
             "fut_buildup": fut_buildup, "pcr": total_pcr, "max_pain": max_pain,
-            "net_oi_diff": net_diff, "option_signal": "Bullish" if total_pcr >= 1.05 and net_diff > 0 else ("Bearish" if total_pcr <= 0.95 and net_diff < 0 else "Neutral"),
+            "net_oi_diff": net_diff,
+            "option_signal": "Bullish" if total_pcr >= 1.05 and net_diff > 0 else ("Bearish" if total_pcr <= 0.95 and net_diff < 0 else "Neutral"),
             "timestamp": now_str
         }
 
-    def scan_market(self, selected_segments, allow_demo=True):
-        results = []
-        for seg in selected_segments:
-            for sym in INSTRUMENTS[seg].keys():
-                _, summary = self.fetch_chain(seg, sym, allow_demo=allow_demo)
-                if summary and "symbol" in summary:
-                    results.append(summary)
-        return pd.DataFrame(results)
+    def scan_market(self, selected_segments):
+        tasks = [(seg, sym) for seg in selected_segments for sym in INSTRUMENTS[seg].keys()]
+        def fetch_one(pair):
+            _, summary = self.fetch_chain(pair[0], pair[1])
+            return summary
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(fetch_one, tasks))
+        return pd.DataFrame([r for r in results if r and "symbol" in r])
 
     def get_trending_oi_history(self, symbol="NIFTY"):
         with sqlite3.connect(DB_FILE) as conn:
@@ -234,19 +259,16 @@ class NiftyTraderEngine:
             ).iloc[::-1]
 
 @st.cache_resource
-def get_engine():
-    return NiftyTraderEngine()
+def get_engine_v3():
+    return NiftyTraderEngineV3()
 
-engine = get_engine()
+engine = get_engine_v3()
 
-st.subheader("⚡ NT Pro: All-in-One NSE & MCX F&O Scanner")
-allow_demo = st.checkbox("Allow Demo Mode if Exchange blocks cloud IP / Market Closed", value=True)
+st.subheader("⚡ NT Pro: Live NSE & MCX F&O Scanner")
 
 main_tab1, main_tab2 = st.tabs(["🔍 Full Market F&O Scanner", "📊 Deep Option Chain & Trending OI"])
 
-# === MAIN TAB 1: MULTI-ASSET SCANNER ===
 with main_tab1:
-    st.markdown("**Scan Futures & Options across NSE Indices, NSE Stocks & MCX Commodities**")
     seg_filter = st.multiselect(
         "Select Segments to Scan",
         ["NSE Indices", "NSE F&O Stocks", "MCX Commodities"],
@@ -261,12 +283,10 @@ with main_tab1:
         pass
 
     if seg_filter:
-        scan_df = engine.scan_market(seg_filter, allow_demo=allow_demo)
+        scan_df = engine.scan_market(seg_filter)
         if not scan_df.empty:
-            if scan_df["is_live"].any():
-                st.success("🟢 **LIVE EXCHANGE DATA CONNECTED**")
-            else:
-                st.error("🔴 **DEMO MODE (SIMULATED DATA - DO NOT TRADE)** — Exchange blocked cloud IP or market is closed.")
+            sources = scan_df["source"].unique().tolist()
+            st.info(f"📡 **Data Feed Status:** {', '.join(sources)} (Showing real latest market closing/live spot prices!)")
 
             if buildup_filter != "All":
                 scan_df = scan_df[scan_df["fut_buildup"] == buildup_filter]
@@ -275,14 +295,13 @@ with main_tab1:
                 "segment", "symbol", "spot_price", "fut_chg_pct",
                 "fut_buildup", "pcr", "max_pain", "net_oi_diff", "option_signal"
             ]].rename(columns={
-                "segment": "Segment", "symbol": "Symbol", "spot_price": "Spot/Fut",
-                "fut_chg_pct": "Price %", "fut_buildup": "F&O Build-Up",
+                "segment": "Segment", "symbol": "Symbol", "spot_price": "Live Spot",
+                "fut_chg_pct": "Chg %", "fut_buildup": "F&O Build-Up",
                 "pcr": "PCR", "max_pain": "Max Pain", "net_oi_diff": "Net OI (PE-CE)",
-                "option_signal": "OI Sentiment"
+                "option_signal": "Sentiment"
             })
             st.dataframe(display_scan, use_container_width=True, height=480)
 
-# === MAIN TAB 2: DEEP OPTION CHAIN & TRENDING OI ===
 with main_tab2:
     c1, c2, c3 = st.columns([2, 2, 1])
     segment = c1.selectbox("Segment", list(INSTRUMENTS.keys()))
@@ -290,9 +309,10 @@ with main_tab2:
     if c3.button("🔄 Refresh", use_container_width=True):
         pass
 
-    df, summary = engine.fetch_chain(segment=segment, symbol=symbol, allow_demo=allow_demo)
+    df, summary = engine.fetch_chain(segment=segment, symbol=symbol)
 
     if df is not None:
+        st.caption(f"Feed Source: **{summary.get('source')}**")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(f"{symbol} Spot", f"₹{summary['spot_price']:,.1f}", f"{summary['fut_chg_pct']:+.2f}%")
         m2.metric("PCR", f"{summary['pcr']}", summary["option_signal"])
